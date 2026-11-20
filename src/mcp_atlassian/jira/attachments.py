@@ -1,8 +1,10 @@
 """Attachment operations for Jira API."""
 
+import hashlib
 import logging
 import mimetypes
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +123,126 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
         except Exception as e:
             logger.error(f"Error downloading attachment: {str(e)}")
             return False
+
+    @staticmethod
+    def _looks_like_html(
+        head: bytes, content_type: str, expected_mime: str | None
+    ) -> bool:
+        """Detect a login page masquerading as an attachment."""
+        expected_html = "html" in (expected_mime or "").lower()
+        text = head[:2048].decode("utf-8", errors="ignore").lstrip().lower()
+        if "<title>登录" in text or "login.jsp" in text:
+            return True
+        if expected_html:
+            return False
+        if text.startswith("<!doctype html") or text.startswith("<html"):
+            return True
+        return "text/html" in (content_type or "").lower()
+
+    def download_attachment_strict(
+        self,
+        url: str,
+        target_path: str,
+        expected_size: int | None = None,
+        expected_mime: str | None = None,
+    ) -> tuple[bool, str]:
+        """Download an attachment with validation; returns ``(ok, error)``."""
+        if not url:
+            return False, "No URL provided for attachment download"
+
+        tmp_path = f"{target_path}.part"
+        try:
+            # Relative paths resolve against the configured file root (the
+            # working directory unless MCP_ATLASSIAN_FILES_DIR or a remote
+            # transport sets another one).
+            if not os.path.isabs(target_path):
+                target_path = os.path.normpath(
+                    os.path.join(get_file_root(), target_path)
+                )
+                tmp_path = f"{target_path}.part"
+
+            # Guard against path traversal (resolves symlinks)
+            validate_safe_path(target_path)
+
+            # Do not write into the working-directory root itself: that is where
+            # Python resolves imports first, so a download landing there could
+            # overwrite an importable module and gain code execution (GHSA-6vmq).
+            # Attachments must be saved into a subdirectory.
+            if is_in_cwd_root(target_path):
+                return (
+                    False,
+                    f"Refusing to download into the working-directory root: {target_path}",
+                )
+
+            logger.info(
+                f"Downloading attachment from {loggable_url(url)} to {target_path}"
+            )
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+            self._ensure_same_origin(url)
+            # allow_redirects=False is the whole point: Jira Server/DC answers
+            # unauthenticated downloads with 302 -> /login.jsp, which requests
+            # would otherwise happily turn into a 200 HTML "attachment".
+            response = self.jira._session.get(url, stream=True, allow_redirects=False)
+            written = 0
+            head = b""
+            ctype = ""
+            try:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("Location", "")
+                    return (
+                        False,
+                        "HTTP redirect to "
+                        f"{location or 'login page'} — the request is not authenticated "
+                        "for /secure/attachment (PAT/Bearer is REST-only on Jira "
+                        "Server/DC; use HTTP Basic or a session cookie)",
+                    )
+                response.raise_for_status()
+                ctype = response.headers.get("Content-Type", "") or ""
+                if not isinstance(ctype, str):
+                    ctype = ""
+
+                # open_confined re-checks the boundary on the descriptor it opens,
+                # so a symlink swapped in since the validation above cannot
+                # redirect the write.
+                with open_confined(tmp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        if len(head) < 2048:
+                            head += chunk[: 2048 - len(head)]
+                        f.write(chunk)
+                        written += len(chunk)
+            finally:
+                response.close()
+
+            if self._looks_like_html(head, ctype, expected_mime):
+                return (
+                    False,
+                    "server returned an HTML login page instead of the attachment "
+                    f"(Content-Type: {ctype or 'unknown'}) — refusing to save it",
+                )
+            if expected_size and written != expected_size:
+                return (
+                    False,
+                    f"size mismatch: received {written} bytes, Jira metadata says "
+                    f"{expected_size}",
+                )
+
+            os.replace(tmp_path, target_path)
+            logger.info(
+                f"Successfully downloaded attachment to {target_path} (size: {written} bytes)"
+            )
+            return True, ""
+
+        except Exception as e:  # noqa: BLE001 - surface the reason to the caller
+            return False, str(e)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def fetch_attachment_content(self, url: str) -> bytes | None:
         """
@@ -329,17 +451,23 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
         }
 
     def download_issue_attachments(
-        self, issue_key: str, target_dir: str
+        self,
+        issue_key: str,
+        target_dir: str,
+        pattern: str | None = None,
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         """
-        Download all attachments for a Jira issue.
+        Download all attachments for a Jira issue to a directory.
 
         Args:
             issue_key: The Jira issue key (e.g., 'PROJ-123')
             target_dir: The directory where attachments should be saved
+            pattern: Optional regex matched against the filename
+            overwrite: Re-download files that already exist
 
         Returns:
-            A dictionary with download results
+            A dictionary with download results (path + sha256 per file)
         """
         # Relative paths resolve against the configured file root (the
         # working directory unless MCP_ATLASSIAN_FILES_DIR or a remote
@@ -391,8 +519,13 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             if isinstance(attachment, dict):
                 attachments.append(JiraAttachment.from_api_response(attachment))
 
+        if pattern:
+            rx = re.compile(pattern)
+            attachments = [a for a in attachments if rx.search(a.filename)]
+
         # Download each attachment
         downloaded = []
+        skipped = []
         failed = []
 
         for attachment in attachments:
@@ -407,27 +540,52 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             safe_filename = Path(attachment.filename).name
             file_path = target_path / safe_filename
 
-            # Download the attachment
-            success = self.download_attachment(attachment.url, str(file_path))
+            if file_path.exists() and not overwrite:
+                existing_size = file_path.stat().st_size
+                if not attachment.size or existing_size == attachment.size:
+                    skipped.append(
+                        {
+                            "filename": attachment.filename,
+                            "path": str(file_path),
+                            "size": existing_size,
+                            "reason": "already exists",
+                        }
+                    )
+                    continue
 
-            if success:
-                downloaded.append(
-                    {
-                        "filename": attachment.filename,
-                        "path": str(file_path),
-                        "size": attachment.size,
-                    }
-                )
+            # Strict download: no redirect following, size/type validated.
+            ok, error = self.download_attachment_strict(
+                attachment.url,
+                str(file_path),
+                expected_size=attachment.size or None,
+                expected_mime=attachment.content_type,
+            )
+
+            if ok:
+                entry = {
+                    "filename": attachment.filename,
+                    "path": str(file_path),
+                    "size": file_path.stat().st_size
+                    if file_path.exists()
+                    else attachment.size,
+                }
+                if file_path.exists():
+                    digest = hashlib.sha256()
+                    with open(file_path, "rb") as fh:
+                        for block in iter(lambda: fh.read(1024 * 1024), b""):
+                            digest.update(block)
+                    entry["sha256"] = digest.hexdigest()
+                downloaded.append(entry)
             else:
-                failed.append(
-                    {"filename": attachment.filename, "error": "Download failed"}
-                )
+                failed.append({"filename": attachment.filename, "error": error})
 
         return {
-            "success": True,
+            "success": not failed,
             "issue_key": issue_key,
+            "target_dir": str(target_path),
             "total": len(attachments),
             "downloaded": downloaded,
+            "skipped": skipped,
             "failed": failed,
         }
 

@@ -251,7 +251,7 @@ class TestAttachmentsMixin:
         # Mock the download_attachment method
         with (
             patch.object(
-                attachments_mixin, "download_attachment", return_value=True
+                attachments_mixin, "download_attachment_strict", return_value=(True, "")
             ) as mock_download,
             patch("pathlib.Path.mkdir") as mock_mkdir,
             patch(
@@ -300,7 +300,7 @@ class TestAttachmentsMixin:
         # Mock path operations
         with (
             patch.object(
-                attachments_mixin, "download_attachment", return_value=True
+                attachments_mixin, "download_attachment_strict", return_value=(True, "")
             ) as mock_download,
             patch("pathlib.Path.mkdir") as mock_mkdir,
             patch(
@@ -412,7 +412,7 @@ class TestAttachmentsMixin:
         # Mock the download_attachment method to succeed for first attachment and fail for second
         with (
             patch.object(
-                attachments_mixin, "download_attachment", side_effect=[True, False]
+                attachments_mixin, "download_attachment_strict", side_effect=[(True, ""), (False, "boom")]
             ) as mock_download,
             patch("pathlib.Path.mkdir") as mock_mkdir,
             patch(
@@ -426,7 +426,7 @@ class TestAttachmentsMixin:
             )
 
             # Assertions
-            assert result["success"] is True
+            assert result["success"] is False
             assert len(result["downloaded"]) == 1
             assert len(result["failed"]) == 1
             assert result["downloaded"][0]["filename"] == "test1.txt"
@@ -471,7 +471,7 @@ class TestAttachmentsMixin:
             )
 
             # Assertions
-            assert result["success"] is True
+            assert result["success"] is False
             assert len(result["downloaded"]) == 0
             assert len(result["failed"]) == 1
             assert result["failed"][0]["filename"] == "test1.txt"

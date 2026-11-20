@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 from typing import Annotated, Any
 
 from fastmcp import Context
@@ -23,6 +24,7 @@ from mcp_atlassian.servers.helpers import resolve_transition
 from mcp_atlassian.servers.scope_guard import JIRA_SCOPE_POLICY, ToolScopeGuard
 from mcp_atlassian.utils.decorators import check_write_access
 from mcp_atlassian.utils.env import get_regex_env
+from mcp_atlassian.utils.io import get_file_root
 from mcp_atlassian.utils.media import (
     ATTACHMENT_MAX_BYTES,
     AttachmentBudget,
@@ -1590,6 +1592,77 @@ async def download_attachments(
     )
 
     return contents
+
+
+@jira_mcp.tool(
+    tags={"jira", "write", "attachments", "toolset:jira_attachments"},
+    annotations={"title": "Download Attachments To Disk", "readOnlyHint": False},
+)
+async def download_attachments_to_disk(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    target_dir: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Server-side directory to save files into. Defaults to "
+                "$MCP_ATLASSIAN_FILES_DIR/<issue-key>. The directory is "
+                "confined to the configured file root."
+            )
+        ),
+    ] = None,
+    filename_pattern: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional regex matched against the attachment filename, "
+                "e.g. '\\.log$' to fetch only logs."
+            )
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        Field(description="Re-download files that already exist."),
+    ] = False,
+) -> str:
+    """Download Jira attachments to server-side disk instead of inline base64.
+
+    This is the large-file friendly counterpart of `download_attachments`.
+    Bytes stay on the server; the response contains only paths, sizes and
+    SHA-256 digests. Downloads are strict: redirects are not followed
+    (Jira Server/DC redirects unauthenticated requests to the login page),
+    HTML login pages are rejected, and the byte count must match Jira's
+    metadata before the file is committed.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        target_dir: Destination directory (defaults to file root / issue key).
+        filename_pattern: Optional filename regex filter.
+        overwrite: Overwrite existing files.
+
+    Returns:
+        JSON string describing downloaded / skipped / failed attachments.
+    """
+    jira = await get_jira_fetcher(ctx)
+
+    if not target_dir:
+        target_dir = str(get_file_root() / issue_key)
+
+    result = await run_fetcher_call(
+        jira.download_issue_attachments,
+        issue_key=issue_key,
+        target_dir=target_dir,
+        pattern=filename_pattern,
+        overwrite=overwrite,
+    )
+    return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @jira_mcp.tool(
