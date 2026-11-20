@@ -1,0 +1,55 @@
+From 8ea1bca9b1699cafd506e1dd353215d72e037702 Mon Sep 17 00:00:00 2001
+From: yhuan <yhuan@localhost>
+Date: Fri, 20 Nov 2026 14:58:46 +0800
+Subject: [PATCH 3/4] chore(deploy): compose + env example for the forked image
+
+---
+ deploy/docker-compose.yml | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+ create mode 100644 deploy/docker-compose.yml
+
+diff --git a/deploy/docker-compose.yml b/deploy/docker-compose.yml
+new file mode 100644
+index 0000000..0128c68
+--- /dev/null
++++ b/deploy/docker-compose.yml
+@@ -0,0 +1,35 @@
++services:
++  jira-mcp:
++    image: mcp-atlassian-jiral:0.24.7
++    container_name: jira-mcp
++    restart: unless-stopped
++    env_file: .env
++    environment:
++      # HTTP 传输默认拒绝无凭据请求（401），单租户网关必须显式允许回落到 .env 里的全局凭据
++      - ALLOW_GLOBAL_CRED_FALLBACK=true
++      # 限制客户端可指定 Jira 域的 SSRF 面
++      - MCP_ALLOWED_URL_DOMAINS=jira.fujikam.com
++      # 附件落盘根目录（jira_download_attachments_to_disk 的默认父目录）
++      - MCP_ATLASSIAN_FILES_DIR=/data
++      - TOOLSETS=all
++    command:
++      - "--transport=streamable-http"
++      - "--host=0.0.0.0"
++      - "--port=8787"
++      - "--path=/mcp"
++      - "--stateless"
++    ports:
++      - "8789:8787"
++    volumes:
++      # 落盘的附件在这里；其它机器要么挂同一目录（NFS/SMB），
++      # 要么在前面加一个带 token 的静态文件服务。
++      - ./data:/data
++    healthcheck:
++      # alpine 镜像没有 curl，用 python 探端口
++      test:
++        - "CMD-SHELL"
++        - "python -c \"import socket;s=socket.socket();s.settimeout(2);exit(s.connect_ex(('127.0.0.1',8787)))\""
++      interval: 30s
++      timeout: 5s
++      retries: 3
++      start_period: 30s
+\ No newline at end of file
+-- 
+2.34.1
+

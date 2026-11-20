@@ -1,6 +1,6 @@
 services:
   jira-mcp:
-    image: mcp-atlassian-jiral:0.24.7
+    image: mcp-atlassian-jiral:0.24.7-jiral.1
     container_name: jira-mcp
     restart: unless-stopped
     env_file: .env
@@ -21,8 +21,6 @@ services:
     ports:
       - "8789:8787"
     volumes:
-      # 落盘的附件在这里；其它机器要么挂同一目录（NFS/SMB），
-      # 要么在前面加一个带 token 的静态文件服务。
       - ./data:/data
     healthcheck:
       # alpine 镜像没有 curl，用 python 探端口
@@ -33,3 +31,21 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  # 附件分发：其它机器用 X-Files-Token 头直接取 /data 下的文件
+  jira-files:
+    image: nginx:alpine
+    container_name: jira-files
+    restart: unless-stopped
+    environment:
+      - FILES_TOKEN=${FILES_TOKEN}
+    volumes:
+      - ./data:/data:ro
+      - ./nginx-files.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - "8790:8790"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8790/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

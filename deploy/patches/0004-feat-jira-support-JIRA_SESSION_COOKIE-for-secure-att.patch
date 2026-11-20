@@ -1,0 +1,92 @@
+From 990c748340f8b81e0807b00a5fa38e7544e27d4f Mon Sep 17 00:00:00 2001
+From: yhuan <yhuan@localhost>
+Date: Fri, 20 Nov 2026 15:07:17 +0800
+Subject: [PATCH 4/4] feat(jira): support JIRA_SESSION_COOKIE for
+ /secure/attachment downloads
+
+CAPTCHA-enforcing Jira Server instances deny HTTP Basic entirely; a copied
+browser session cookie is then the only non-interactive path. The cookie is
+sent only for attachment downloads and never logged.
+---
+ src/mcp_atlassian/jira/attachments.py      | 21 +++++++++++++++++----
+ tests/unit/jira/test_attachments_strict.py | 22 +++++++++++++++++++++-
+ 2 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/src/mcp_atlassian/jira/attachments.py b/src/mcp_atlassian/jira/attachments.py
+index 5f84d43..6f77cfd 100644
+--- a/src/mcp_atlassian/jira/attachments.py
++++ b/src/mcp_atlassian/jira/attachments.py
+@@ -180,22 +180,35 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
+             os.makedirs(os.path.dirname(target_path), exist_ok=True)
+ 
+             self._ensure_same_origin(url)
++            # Session-cookie mode: Jira Server/DC with an enforced CAPTCHA (or a
++            # login-policy that denies HTTP Basic) can only be reached through
++            # the same web session a browser would use. The cookie is read from
++            # the environment so the container needs no interactive login.
++            cookie = os.getenv("JIRA_SESSION_COOKIE", "").strip()
+             # allow_redirects=False is the whole point: Jira Server/DC answers
+             # unauthenticated downloads with 302 -> /login.jsp, which requests
+             # would otherwise happily turn into a 200 HTML "attachment".
+-            response = self.jira._session.get(url, stream=True, allow_redirects=False)
++            extra = {"headers": {"Cookie": cookie}} if cookie else {}
++            response = self.jira._session.get(
++                url, stream=True, allow_redirects=False, **extra
++            )
+             written = 0
+             head = b""
+             ctype = ""
+             try:
+                 if response.status_code in (301, 302, 303, 307, 308):
+                     location = response.headers.get("Location", "")
++                    hint = (
++                        "the configured JIRA_SESSION_COOKIE is expired or rejected"
++                        if cookie
++                        else "use HTTP Basic, JIRA_SESSION_COOKIE, or a working login"
++                    )
+                     return (
+                         False,
+                         "HTTP redirect to "
+-                        f"{location or 'login page'} — the request is not authenticated "
+-                        "for /secure/attachment (PAT/Bearer is REST-only on Jira "
+-                        "Server/DC; use HTTP Basic or a session cookie)",
++                        f"{location or 'login page'} — not authenticated for "
++                        f"/secure/attachment (PAT/Bearer is REST-only on Jira "
++                        f"Server/DC; {hint})",
+                     )
+                 response.raise_for_status()
+                 ctype = response.headers.get("Content-Type", "") or ""
+diff --git a/tests/unit/jira/test_attachments_strict.py b/tests/unit/jira/test_attachments_strict.py
+index 668ca22..02842bd 100644
+--- a/tests/unit/jira/test_attachments_strict.py
++++ b/tests/unit/jira/test_attachments_strict.py
+@@ -94,4 +94,24 @@ def test_good_file_passes(mixin):
+     assert err == ""
+     mixin.jira._session.get.assert_called_with(
+         "https://test.url/attachment", stream=True, allow_redirects=False
+-    )
+\ No newline at end of file
++    )
++
++def test_session_cookie_is_sent(mixin, monkeypatch):
++    data = b"log line\n" * 20
++    resp = _FakeResponse(
++        status=200, headers={"Content-Type": "text/plain"}, chunks=[data]
++    )
++    monkeypatch.setenv("JIRA_SESSION_COOKIE", "JSESSIONID=abc123; atlassian.xsrf.token=xyz")
++    ok, _ = _call(mixin, resp, "/tmp/dl/a.log", size=len(data))
++    assert ok is True
++    _, kwargs = mixin.jira._session.get.call_args
++    assert kwargs["headers"] == {"Cookie": "JSESSIONID=abc123; atlassian.xsrf.token=xyz"}
++    assert kwargs["allow_redirects"] is False
++
++
++def test_expired_cookie_hint(mixin, monkeypatch):
++    monkeypatch.setenv("JIRA_SESSION_COOKIE", "JSESSIONID=stale")
++    resp = _FakeResponse(status=302, headers={"Location": "/login.jsp"})
++    ok, err = _call(mixin, resp, "/tmp/dl/a.log")
++    assert ok is False
++    assert "JIRA_SESSION_COOKIE" in err and "expired" in err
+-- 
+2.34.1
+

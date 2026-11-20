@@ -1,0 +1,29 @@
+From 52f871951b0efdbf1c4fc1577f1465afdded8cf8 Mon Sep 17 00:00:00 2001
+From: yhuan <yhuan@localhost>
+Date: Fri, 20 Nov 2026 14:58:37 +0800
+Subject: [PATCH 2/4] fix(scope): classify attachment download args as unscoped
+ (filesystem/output options)
+
+---
+ src/mcp_atlassian/servers/scope_guard.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/mcp_atlassian/servers/scope_guard.py b/src/mcp_atlassian/servers/scope_guard.py
+index 73223db..cbedaca 100644
+--- a/src/mcp_atlassian/servers/scope_guard.py
++++ b/src/mcp_atlassian/servers/scope_guard.py
+@@ -146,6 +146,11 @@ JIRA_SCOPE_POLICY = ScopePolicy(
+             "properties",
+             "update_history",
+             "include",
++            # Attachment download target (server-side filesystem, not a
++            # project-scoped Jira resource).
++            "target_dir",
++            "filename_pattern",
++            "overwrite",
+             # Epic children are fetched through SearchMixin, which ANDs the
+             # allowlist into the JQL.
+             "epic_summary_children",
+-- 
+2.34.1
+

@@ -1,0 +1,527 @@
+From b0d721d8db1a73e8e0f53e387bdd15b5f846f97d Mon Sep 17 00:00:00 2001
+From: yhuan <yhuan@localhost>
+Date: Fri, 20 Nov 2026 14:54:32 +0800
+Subject: [PATCH 1/4] feat(jira): download attachments to server disk with
+ strict validation
+
+- add download_attachment_strict(): no redirect following (Jira Server/DC
+  redirects unauthenticated /secure/attachment requests to the login page),
+  reject HTML login pages, verify byte count against Jira metadata, atomic
+  .part -> replace
+- download_issue_attachments(): add pattern/overwrite, sha256, skipped list,
+  success reflects partial failures
+- expose jira_download_attachments_to_disk MCP tool (toolset: jira_attachments)
+  so large attachments stay on disk instead of being inlined as base64
+- tests: strict paths (redirect / login page / size mismatch / ok)
+---
+ src/mcp_atlassian/jira/attachments.py      | 192 +++++++++++++++++++--
+ src/mcp_atlassian/servers/jira.py          |  73 ++++++++
+ tests/unit/jira/test_attachments.py        |  10 +-
+ tests/unit/jira/test_attachments_strict.py |  97 +++++++++++
+ 4 files changed, 350 insertions(+), 22 deletions(-)
+ create mode 100644 tests/unit/jira/test_attachments_strict.py
+
+diff --git a/src/mcp_atlassian/jira/attachments.py b/src/mcp_atlassian/jira/attachments.py
+index ba680c1..5f84d43 100644
+--- a/src/mcp_atlassian/jira/attachments.py
++++ b/src/mcp_atlassian/jira/attachments.py
+@@ -1,8 +1,10 @@
+ """Attachment operations for Jira API."""
+ 
++import hashlib
+ import logging
+ import mimetypes
+ import os
++import re
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -122,6 +124,126 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
+             logger.error(f"Error downloading attachment: {str(e)}")
+             return False
+ 
++    @staticmethod
++    def _looks_like_html(
++        head: bytes, content_type: str, expected_mime: str | None
++    ) -> bool:
++        """Detect a login page masquerading as an attachment."""
++        expected_html = "html" in (expected_mime or "").lower()
++        text = head[:2048].decode("utf-8", errors="ignore").lstrip().lower()
++        if "<title>登录" in text or "login.jsp" in text:
++            return True
++        if expected_html:
++            return False
++        if text.startswith("<!doctype html") or text.startswith("<html"):
++            return True
++        return "text/html" in (content_type or "").lower()
++
++    def download_attachment_strict(
++        self,
++        url: str,
++        target_path: str,
++        expected_size: int | None = None,
++        expected_mime: str | None = None,
++    ) -> tuple[bool, str]:
++        """Download an attachment with validation; returns ``(ok, error)``."""
++        if not url:
++            return False, "No URL provided for attachment download"
++
++        tmp_path = f"{target_path}.part"
++        try:
++            # Relative paths resolve against the configured file root (the
++            # working directory unless MCP_ATLASSIAN_FILES_DIR or a remote
++            # transport sets another one).
++            if not os.path.isabs(target_path):
++                target_path = os.path.normpath(
++                    os.path.join(get_file_root(), target_path)
++                )
++                tmp_path = f"{target_path}.part"
++
++            # Guard against path traversal (resolves symlinks)
++            validate_safe_path(target_path)
++
++            # Do not write into the working-directory root itself: that is where
++            # Python resolves imports first, so a download landing there could
++            # overwrite an importable module and gain code execution (GHSA-6vmq).
++            # Attachments must be saved into a subdirectory.
++            if is_in_cwd_root(target_path):
++                return (
++                    False,
++                    f"Refusing to download into the working-directory root: {target_path}",
++                )
++
++            logger.info(
++                f"Downloading attachment from {loggable_url(url)} to {target_path}"
++            )
++            os.makedirs(os.path.dirname(target_path), exist_ok=True)
++
++            self._ensure_same_origin(url)
++            # allow_redirects=False is the whole point: Jira Server/DC answers
++            # unauthenticated downloads with 302 -> /login.jsp, which requests
++            # would otherwise happily turn into a 200 HTML "attachment".
++            response = self.jira._session.get(url, stream=True, allow_redirects=False)
++            written = 0
++            head = b""
++            ctype = ""
++            try:
++                if response.status_code in (301, 302, 303, 307, 308):
++                    location = response.headers.get("Location", "")
++                    return (
++                        False,
++                        "HTTP redirect to "
++                        f"{location or 'login page'} — the request is not authenticated "
++                        "for /secure/attachment (PAT/Bearer is REST-only on Jira "
++                        "Server/DC; use HTTP Basic or a session cookie)",
++                    )
++                response.raise_for_status()
++                ctype = response.headers.get("Content-Type", "") or ""
++                if not isinstance(ctype, str):
++                    ctype = ""
++
++                # open_confined re-checks the boundary on the descriptor it opens,
++                # so a symlink swapped in since the validation above cannot
++                # redirect the write.
++                with open_confined(tmp_path, "wb") as f:
++                    for chunk in response.iter_content(chunk_size=8192):
++                        if not chunk:
++                            continue
++                        if len(head) < 2048:
++                            head += chunk[: 2048 - len(head)]
++                        f.write(chunk)
++                        written += len(chunk)
++            finally:
++                response.close()
++
++            if self._looks_like_html(head, ctype, expected_mime):
++                return (
++                    False,
++                    "server returned an HTML login page instead of the attachment "
++                    f"(Content-Type: {ctype or 'unknown'}) — refusing to save it",
++                )
++            if expected_size and written != expected_size:
++                return (
++                    False,
++                    f"size mismatch: received {written} bytes, Jira metadata says "
++                    f"{expected_size}",
++                )
++
++            os.replace(tmp_path, target_path)
++            logger.info(
++                f"Successfully downloaded attachment to {target_path} (size: {written} bytes)"
++            )
++            return True, ""
++
++        except Exception as e:  # noqa: BLE001 - surface the reason to the caller
++            return False, str(e)
++        finally:
++            try:
++                if os.path.exists(tmp_path):
++                    os.unlink(tmp_path)
++            except OSError:
++                pass
++
+     def fetch_attachment_content(self, url: str) -> bytes | None:
+         """
+         Fetch attachment content into memory.
+@@ -329,17 +451,23 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
+         }
+ 
+     def download_issue_attachments(
+-        self, issue_key: str, target_dir: str
++        self,
++        issue_key: str,
++        target_dir: str,
++        pattern: str | None = None,
++        overwrite: bool = False,
+     ) -> dict[str, Any]:
+         """
+-        Download all attachments for a Jira issue.
++        Download all attachments for a Jira issue to a directory.
+ 
+         Args:
+             issue_key: The Jira issue key (e.g., 'PROJ-123')
+             target_dir: The directory where attachments should be saved
++            pattern: Optional regex matched against the filename
++            overwrite: Re-download files that already exist
+ 
+         Returns:
+-            A dictionary with download results
++            A dictionary with download results (path + sha256 per file)
+         """
+         # Relative paths resolve against the configured file root (the
+         # working directory unless MCP_ATLASSIAN_FILES_DIR or a remote
+@@ -391,8 +519,13 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
+             if isinstance(attachment, dict):
+                 attachments.append(JiraAttachment.from_api_response(attachment))
+ 
++        if pattern:
++            rx = re.compile(pattern)
++            attachments = [a for a in attachments if rx.search(a.filename)]
++
+         # Download each attachment
+         downloaded = []
++        skipped = []
+         failed = []
+ 
+         for attachment in attachments:
+@@ -407,27 +540,52 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
+             safe_filename = Path(attachment.filename).name
+             file_path = target_path / safe_filename
+ 
+-            # Download the attachment
+-            success = self.download_attachment(attachment.url, str(file_path))
++            if file_path.exists() and not overwrite:
++                existing_size = file_path.stat().st_size
++                if not attachment.size or existing_size == attachment.size:
++                    skipped.append(
++                        {
++                            "filename": attachment.filename,
++                            "path": str(file_path),
++                            "size": existing_size,
++                            "reason": "already exists",
++                        }
++                    )
++                    continue
++
++            # Strict download: no redirect following, size/type validated.
++            ok, error = self.download_attachment_strict(
++                attachment.url,
++                str(file_path),
++                expected_size=attachment.size or None,
++                expected_mime=attachment.content_type,
++            )
+ 
+-            if success:
+-                downloaded.append(
+-                    {
+-                        "filename": attachment.filename,
+-                        "path": str(file_path),
+-                        "size": attachment.size,
+-                    }
+-                )
++            if ok:
++                entry = {
++                    "filename": attachment.filename,
++                    "path": str(file_path),
++                    "size": file_path.stat().st_size
++                    if file_path.exists()
++                    else attachment.size,
++                }
++                if file_path.exists():
++                    digest = hashlib.sha256()
++                    with open(file_path, "rb") as fh:
++                        for block in iter(lambda: fh.read(1024 * 1024), b""):
++                            digest.update(block)
++                    entry["sha256"] = digest.hexdigest()
++                downloaded.append(entry)
+             else:
+-                failed.append(
+-                    {"filename": attachment.filename, "error": "Download failed"}
+-                )
++                failed.append({"filename": attachment.filename, "error": error})
+ 
+         return {
+-            "success": True,
++            "success": not failed,
+             "issue_key": issue_key,
++            "target_dir": str(target_path),
+             "total": len(attachments),
+             "downloaded": downloaded,
++            "skipped": skipped,
+             "failed": failed,
+         }
+ 
+diff --git a/src/mcp_atlassian/servers/jira.py b/src/mcp_atlassian/servers/jira.py
+index 84f5aa8..b85fa6a 100644
+--- a/src/mcp_atlassian/servers/jira.py
++++ b/src/mcp_atlassian/servers/jira.py
+@@ -4,6 +4,7 @@ import base64
+ import binascii
+ import json
+ import logging
++import os
+ from typing import Annotated, Any
+ 
+ from fastmcp import Context
+@@ -23,6 +24,7 @@ from mcp_atlassian.servers.helpers import resolve_transition
+ from mcp_atlassian.servers.scope_guard import JIRA_SCOPE_POLICY, ToolScopeGuard
+ from mcp_atlassian.utils.decorators import check_write_access
+ from mcp_atlassian.utils.env import get_regex_env
++from mcp_atlassian.utils.io import get_file_root
+ from mcp_atlassian.utils.media import (
+     ATTACHMENT_MAX_BYTES,
+     AttachmentBudget,
+@@ -1592,6 +1594,77 @@ async def download_attachments(
+     return contents
+ 
+ 
++@jira_mcp.tool(
++    tags={"jira", "write", "attachments", "toolset:jira_attachments"},
++    annotations={"title": "Download Attachments To Disk", "readOnlyHint": False},
++)
++async def download_attachments_to_disk(
++    ctx: Context,
++    issue_key: Annotated[
++        str,
++        Field(
++            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
++            pattern=ISSUE_KEY_PATTERN,
++        ),
++    ],
++    target_dir: Annotated[
++        str | None,
++        Field(
++            description=(
++                "Server-side directory to save files into. Defaults to "
++                "$MCP_ATLASSIAN_FILES_DIR/<issue-key>. The directory is "
++                "confined to the configured file root."
++            )
++        ),
++    ] = None,
++    filename_pattern: Annotated[
++        str | None,
++        Field(
++            description=(
++                "Optional regex matched against the attachment filename, "
++                "e.g. '\\.log$' to fetch only logs."
++            )
++        ),
++    ] = None,
++    overwrite: Annotated[
++        bool,
++        Field(description="Re-download files that already exist."),
++    ] = False,
++) -> str:
++    """Download Jira attachments to server-side disk instead of inline base64.
++
++    This is the large-file friendly counterpart of `download_attachments`.
++    Bytes stay on the server; the response contains only paths, sizes and
++    SHA-256 digests. Downloads are strict: redirects are not followed
++    (Jira Server/DC redirects unauthenticated requests to the login page),
++    HTML login pages are rejected, and the byte count must match Jira's
++    metadata before the file is committed.
++
++    Args:
++        ctx: The FastMCP context.
++        issue_key: Jira issue key.
++        target_dir: Destination directory (defaults to file root / issue key).
++        filename_pattern: Optional filename regex filter.
++        overwrite: Overwrite existing files.
++
++    Returns:
++        JSON string describing downloaded / skipped / failed attachments.
++    """
++    jira = await get_jira_fetcher(ctx)
++
++    if not target_dir:
++        target_dir = str(get_file_root() / issue_key)
++
++    result = await run_fetcher_call(
++        jira.download_issue_attachments,
++        issue_key=issue_key,
++        target_dir=target_dir,
++        pattern=filename_pattern,
++        overwrite=overwrite,
++    )
++    return json.dumps(result, indent=2, ensure_ascii=False)
++
++
+ @jira_mcp.tool(
+     tags={"jira", "read", "attachments", "toolset:jira_attachments"},
+     annotations={"title": "Get Issue Images", "readOnlyHint": True},
+diff --git a/tests/unit/jira/test_attachments.py b/tests/unit/jira/test_attachments.py
+index 2649609..4fda68f 100644
+--- a/tests/unit/jira/test_attachments.py
++++ b/tests/unit/jira/test_attachments.py
+@@ -251,7 +251,7 @@ class TestAttachmentsMixin:
+         # Mock the download_attachment method
+         with (
+             patch.object(
+-                attachments_mixin, "download_attachment", return_value=True
++                attachments_mixin, "download_attachment_strict", return_value=(True, "")
+             ) as mock_download,
+             patch("pathlib.Path.mkdir") as mock_mkdir,
+             patch(
+@@ -300,7 +300,7 @@ class TestAttachmentsMixin:
+         # Mock path operations
+         with (
+             patch.object(
+-                attachments_mixin, "download_attachment", return_value=True
++                attachments_mixin, "download_attachment_strict", return_value=(True, "")
+             ) as mock_download,
+             patch("pathlib.Path.mkdir") as mock_mkdir,
+             patch(
+@@ -412,7 +412,7 @@ class TestAttachmentsMixin:
+         # Mock the download_attachment method to succeed for first attachment and fail for second
+         with (
+             patch.object(
+-                attachments_mixin, "download_attachment", side_effect=[True, False]
++                attachments_mixin, "download_attachment_strict", side_effect=[(True, ""), (False, "boom")]
+             ) as mock_download,
+             patch("pathlib.Path.mkdir") as mock_mkdir,
+             patch(
+@@ -426,7 +426,7 @@ class TestAttachmentsMixin:
+             )
+ 
+             # Assertions
+-            assert result["success"] is True
++            assert result["success"] is False
+             assert len(result["downloaded"]) == 1
+             assert len(result["failed"]) == 1
+             assert result["downloaded"][0]["filename"] == "test1.txt"
+@@ -471,7 +471,7 @@ class TestAttachmentsMixin:
+             )
+ 
+             # Assertions
+-            assert result["success"] is True
++            assert result["success"] is False
+             assert len(result["downloaded"]) == 0
+             assert len(result["failed"]) == 1
+             assert result["failed"][0]["filename"] == "test1.txt"
+diff --git a/tests/unit/jira/test_attachments_strict.py b/tests/unit/jira/test_attachments_strict.py
+new file mode 100644
+index 0000000..668ca22
+--- /dev/null
++++ b/tests/unit/jira/test_attachments_strict.py
+@@ -0,0 +1,97 @@
++"""Fork-specific tests: strict attachment download (no redirects, no login pages)."""
++
++import io
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++
++class _FakeResponse:
++    """Minimal stand-in for requests.Response."""
++
++    def __init__(self, status=200, headers=None, chunks=None):
++        self.status_code = status
++        self.headers = headers or {}
++        self._chunks = chunks or []
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            import requests
++
++            raise requests.HTTPError(f"HTTP {self.status_code}")
++
++    def iter_content(self, chunk_size=8192):
++        yield from self._chunks
++
++    def close(self):
++        pass
++
++
++@pytest.fixture
++def mixin(jira_fetcher):
++    jira_fetcher.jira = MagicMock()
++    jira_fetcher.jira._session = MagicMock()
++    jira_fetcher.jira.url = "https://test.url"
++    return jira_fetcher
++
++
++def _call(mixin, response, target, size=None, mime="text/plain"):
++    mixin.jira._session.get.return_value = response
++    with (
++        patch("os.makedirs"),
++        patch("os.replace"),
++        patch("mcp_atlassian.jira.attachments.validate_safe_path"),
++        patch("mcp_atlassian.jira.attachments.is_in_cwd_root", return_value=False),
++        patch("mcp_atlassian.jira.attachments.get_file_root", return_value="/tmp/dl"),
++        patch("mcp_atlassian.jira.attachments.open_confined", side_effect=lambda p, m: io.BytesIO()),
++    ):
++        return mixin.download_attachment_strict(
++            "https://test.url/attachment", target, expected_size=size, expected_mime=mime
++        )
++
++
++def test_redirect_is_rejected(mixin):
++    resp = _FakeResponse(
++        status=302, headers={"Location": "/login.jsp?permissionViolation=true"}
++    )
++    ok, err = _call(mixin, resp, "/tmp/dl/a.log", size=10)
++    assert ok is False
++    assert "redirect" in err.lower()
++
++
++def test_login_page_is_rejected(mixin):
++    html = b"<!DOCTYPE html><html><head><title>\xe7\x99\xbb\xe5\xbd\x95 - Jira</title></head></html>"
++    resp = _FakeResponse(
++        status=200,
++        headers={"Content-Type": "text/html;charset=UTF-8"},
++        chunks=[html],
++    )
++    ok, err = _call(mixin, resp, "/tmp/dl/a.log", size=len(html))
++    assert ok is False
++    assert "html" in err.lower()
++
++
++def test_size_mismatch_is_rejected(mixin):
++    resp = _FakeResponse(
++        status=200,
++        headers={"Content-Type": "text/plain"},
++        chunks=[b"x" * 100],
++    )
++    ok, err = _call(mixin, resp, "/tmp/dl/a.log", size=1000)
++    assert ok is False
++    assert "size mismatch" in err.lower()
++
++
++def test_good_file_passes(mixin):
++    data = b"2026-11-16 09:56:09 dsp log line\n" * 10
++    resp = _FakeResponse(
++        status=200,
++        headers={"Content-Type": "text/plain"},
++        chunks=[data],
++    )
++    ok, err = _call(mixin, resp, "/tmp/dl/a.log", size=len(data))
++    assert ok is True
++    assert err == ""
++    mixin.jira._session.get.assert_called_with(
++        "https://test.url/attachment", stream=True, allow_redirects=False
++    )
+\ No newline at end of file
+-- 
+2.34.1
+
