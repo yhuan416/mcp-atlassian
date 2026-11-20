@@ -146,6 +146,11 @@ JIRA_SCOPE_POLICY = ScopePolicy(
             "properties",
             "update_history",
             "include",
+            # Attachment download target (server-side filesystem, not a
+            # project-scoped Jira resource).
+            "target_dir",
+            "filename_pattern",
+            "overwrite",
             # Epic children are fetched through SearchMixin, which ANDs the
             # allowlist into the JQL.
             "epic_summary_children",
