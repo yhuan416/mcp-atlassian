@@ -180,22 +180,35 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
             self._ensure_same_origin(url)
+            # Session-cookie mode: Jira Server/DC with an enforced CAPTCHA (or a
+            # login-policy that denies HTTP Basic) can only be reached through
+            # the same web session a browser would use. The cookie is read from
+            # the environment so the container needs no interactive login.
+            cookie = os.getenv("JIRA_SESSION_COOKIE", "").strip()
             # allow_redirects=False is the whole point: Jira Server/DC answers
             # unauthenticated downloads with 302 -> /login.jsp, which requests
             # would otherwise happily turn into a 200 HTML "attachment".
-            response = self.jira._session.get(url, stream=True, allow_redirects=False)
+            extra = {"headers": {"Cookie": cookie}} if cookie else {}
+            response = self.jira._session.get(
+                url, stream=True, allow_redirects=False, **extra
+            )
             written = 0
             head = b""
             ctype = ""
             try:
                 if response.status_code in (301, 302, 303, 307, 308):
                     location = response.headers.get("Location", "")
+                    hint = (
+                        "the configured JIRA_SESSION_COOKIE is expired or rejected"
+                        if cookie
+                        else "use HTTP Basic, JIRA_SESSION_COOKIE, or a working login"
+                    )
                     return (
                         False,
                         "HTTP redirect to "
-                        f"{location or 'login page'} — the request is not authenticated "
-                        "for /secure/attachment (PAT/Bearer is REST-only on Jira "
-                        "Server/DC; use HTTP Basic or a session cookie)",
+                        f"{location or 'login page'} — not authenticated for "
+                        f"/secure/attachment (PAT/Bearer is REST-only on Jira "
+                        f"Server/DC; {hint})",
                     )
                 response.raise_for_status()
                 ctype = response.headers.get("Content-Type", "") or ""

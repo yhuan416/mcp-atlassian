@@ -95,3 +95,23 @@ def test_good_file_passes(mixin):
     mixin.jira._session.get.assert_called_with(
         "https://test.url/attachment", stream=True, allow_redirects=False
     )
+
+def test_session_cookie_is_sent(mixin, monkeypatch):
+    data = b"log line\n" * 20
+    resp = _FakeResponse(
+        status=200, headers={"Content-Type": "text/plain"}, chunks=[data]
+    )
+    monkeypatch.setenv("JIRA_SESSION_COOKIE", "JSESSIONID=abc123; atlassian.xsrf.token=xyz")
+    ok, _ = _call(mixin, resp, "/tmp/dl/a.log", size=len(data))
+    assert ok is True
+    _, kwargs = mixin.jira._session.get.call_args
+    assert kwargs["headers"] == {"Cookie": "JSESSIONID=abc123; atlassian.xsrf.token=xyz"}
+    assert kwargs["allow_redirects"] is False
+
+
+def test_expired_cookie_hint(mixin, monkeypatch):
+    monkeypatch.setenv("JIRA_SESSION_COOKIE", "JSESSIONID=stale")
+    resp = _FakeResponse(status=302, headers={"Location": "/login.jsp"})
+    ok, err = _call(mixin, resp, "/tmp/dl/a.log")
+    assert ok is False
+    assert "JIRA_SESSION_COOKIE" in err and "expired" in err
